@@ -22,6 +22,11 @@ describe Sqewer::Worker, :sqs => true do
     expect(default_worker).to respond_to(:stop)
   end
     
+  it 'instantiates a new worker object on every call to .default' do
+    workers = (1..10).map { described_class.default }
+    expect(workers.uniq.length).to eq(10)
+  end
+  
   it 'instantiates a Logger to STDERR by default' do
     expect(Logger).to receive(:new).with(STDERR)
     worker = described_class.new
@@ -42,6 +47,38 @@ describe Sqewer::Worker, :sqs => true do
     }.to raise_error(/Cannot change state/)
   end
   
+  context 'when the connection to SQS hangs in receive_messages' do
+    it 'is able to die with dignity' do
+      fake_conn = double('Hung connection')
+      allow(fake_conn).to receive(:receive_messages) {
+        loop { sleep 0.5 }
+      }
+      worker = described_class.new(logger: test_logger, connection: fake_conn)
+      worker.start
+      sleep 2
+      worker.stop
+    end
+  end
+
+  context 'when the connection to SQS fails in receive_messages' do
+    it 'it stops itself gracefully' do
+      fake_conn = double('bad connection')
+      allow(fake_conn).to receive(:receive_messages).and_raise("boom")
+
+      log_device = StringIO.new('')
+      worker = described_class.new(logger: Logger.new(log_device), connection: fake_conn)
+
+      expect(worker).to receive(:stop).at_least(:once)
+      expect(worker).not_to receive(:kill)
+
+      worker.start
+      wait_for(worker.state.in_state?(:stopped))
+      wait_for{
+        log_device.string
+      }.to include("boom")
+    end
+  end
+  
   context 'when the job payload cannot be unserialized from JSON due to invalid syntax' do
     it 'is able to cope with an exception when the job class is unknown (one of generic exceptions)' do
       client = Aws::SQS::Client.new
@@ -57,7 +94,7 @@ describe Sqewer::Worker, :sqs => true do
   
   context 'when the job cannot be instantiated due to an unknown class' do
     it 'is able to cope with an exception when the job class is unknown (one of generic exceptions)' do
-      payload = JSON.dump({job_class: 'UnknownJobClass', arg1: 'some value'})
+      payload = JSON.dump({_job_class: 'UnknownJobClass', _job_params: {arg1: 'some value'}})
     
       client = Aws::SQS::Client.new
       client.send_message(queue_url: ENV.fetch('SQS_QUEUE_URL'), message_body: payload)
@@ -77,18 +114,18 @@ describe Sqewer::Worker, :sqs => true do
     it 'sets up the processing pipeline so that jobs can execute in sequence (with threads)' do
       class SecondaryJob
         def run
-          File.open('secondary-job-run','w') {}
+          File.open(File.join(Dir.tmpdir, 'secondary-job-run'),'w') {}
         end
       end
       
       class InitialJob
         def run(executor)
-          File.open('initial-job-run','w') {}
+          File.open(File.join(Dir.tmpdir, 'initial-job-run'),'w') {}
           executor.submit!(SecondaryJob.new)
         end
       end
       
-      payload = JSON.dump({job_class: 'InitialJob'})
+      payload = JSON.dump({_job_class: 'InitialJob'})
       client = Aws::SQS::Client.new
       client.send_message(queue_url: ENV.fetch('SQS_QUEUE_URL'), message_body: payload)
       
@@ -97,11 +134,8 @@ describe Sqewer::Worker, :sqs => true do
       worker.start
       
       begin
-        wait_for { File.exist?('initial-job-run') }.to eq(true)
-        wait_for { File.exist?('secondary-job-run') }.to eq(true)
-        
-        File.unlink('initial-job-run')
-        File.unlink('secondary-job-run')
+        wait_for { File.exist?(File.join(Dir.tmpdir, 'initial-job-run')) }.to eq(true)
+        wait_for { File.exist?(File.join(Dir.tmpdir, 'secondary-job-run')) }.to eq(true)
       ensure
         worker.stop
       end
